@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -1203,3 +1205,104 @@ func TestLink_SkipsBaseFix_ForNewlyCreatedPRs(t *testing.T) {
 
 // Silence "imported and not used" for fmt in case test helpers use it.
 var _ = fmt.Sprintf
+
+func TestLink_BranchNames_UsesPRTemplate(t *testing.T) {
+	tmpDir := t.TempDir()
+	ghDir := filepath.Join(tmpDir, ".github")
+	require.NoError(t, os.MkdirAll(ghDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(ghDir, "pull_request_template.md"),
+		[]byte("## Summary\n\nDescribe your changes."),
+		0o644,
+	))
+
+	mock := newLinkGitMock("feat-a", "feat-b")
+	mock.RootDirFn = func() (string, error) { return tmpDir, nil }
+	restore := git.SetOps(mock)
+	defer restore()
+
+	var capturedBody string
+	cfg, _, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{
+		FindPRForBranchFn: func(string) (*github.PullRequest, error) {
+			return nil, nil // No existing PRs
+		},
+		CreatePRFn: func(base, head, title, body string, draft bool) (*github.PullRequest, error) {
+			capturedBody = body
+			return &github.PullRequest{
+				Number: 1, HeadRefName: head, BaseRefName: base,
+				URL: "https://github.com/o/r/pull/1",
+			}, nil
+		},
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{}, nil
+		},
+		CreateStackFn: func([]int) (int, error) { return 42, nil },
+	}
+
+	cmd := LinkCmd(cfg)
+	cmd.SetArgs([]string{"feat-a", "feat-b"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+
+	cfg.Err.Close()
+	_, _ = io.ReadAll(errR)
+
+	assert.NoError(t, err)
+	assert.Contains(t, capturedBody, "## Summary")
+	assert.Contains(t, capturedBody, "Describe your changes.")
+	assert.NotContains(t, capturedBody, "GitHub Stacks CLI", "footer should not be present when template is used")
+}
+
+func TestLink_PRNumbers_NoTemplateUsesFooter(t *testing.T) {
+	// When using PR numbers (no local repo context), no template is found
+	// and the footer should be present for newly created PRs.
+	mock := &git.MockOps{
+		RootDirFn: func() (string, error) {
+			return "", fmt.Errorf("not in a git repo")
+		},
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	var capturedBody string
+	cfg, _, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{
+		FindPRByNumberFn: func(n int) (*github.PullRequest, error) {
+			if n == 10 {
+				return &github.PullRequest{
+					Number: 10, HeadRefName: "feat-a", BaseRefName: "main",
+					URL: "https://github.com/o/r/pull/10",
+				}, nil
+			}
+			return nil, nil // PR 20 doesn't exist → will create
+		},
+		FindPRForBranchFn: func(branch string) (*github.PullRequest, error) {
+			return nil, nil
+		},
+		CreatePRFn: func(base, head, title, body string, draft bool) (*github.PullRequest, error) {
+			capturedBody = body
+			return &github.PullRequest{
+				Number: 20, HeadRefName: head, BaseRefName: base,
+				URL: "https://github.com/o/r/pull/20",
+			}, nil
+		},
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{}, nil
+		},
+		CreateStackFn: func([]int) (int, error) { return 42, nil },
+	}
+
+	cmd := LinkCmd(cfg)
+	cmd.SetArgs([]string{"10", "20"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+
+	cfg.Err.Close()
+	_, _ = io.ReadAll(errR)
+
+	assert.NoError(t, err)
+	assert.Contains(t, capturedBody, "GitHub Stacks CLI", "footer should be present when no template")
+}
