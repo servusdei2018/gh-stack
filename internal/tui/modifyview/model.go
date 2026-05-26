@@ -11,6 +11,7 @@ import (
 	"github.com/github/gh-stack/internal/git"
 	"github.com/github/gh-stack/internal/stack"
 	"github.com/github/gh-stack/internal/tui/shared"
+	"github.com/github/gh-stack/internal/tui/stackview"
 )
 
 // modifyKeyMap defines key bindings for the modify view.
@@ -23,6 +24,8 @@ type modifyKeyMap struct {
 	FoldDown      key.Binding
 	FoldUp        key.Binding
 	Rename        key.Binding
+	InsertBelow   key.Binding
+	InsertAbove   key.Binding
 	Undo          key.Binding
 	ToggleCommits key.Binding
 	ToggleFiles   key.Binding
@@ -32,7 +35,7 @@ type modifyKeyMap struct {
 }
 
 func (k modifyKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Drop, k.FoldDown, k.Rename, k.ToggleCommits, k.ToggleFiles, k.Apply, k.Help, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Drop, k.FoldDown, k.InsertBelow, k.Rename, k.ToggleCommits, k.ToggleFiles, k.Apply, k.Help, k.Quit}
 }
 
 func (k modifyKeyMap) FullHelp() [][]key.Binding {
@@ -71,6 +74,14 @@ var modifyKeys = modifyKeyMap{
 	Rename: key.NewBinding(
 		key.WithKeys("r"),
 		key.WithHelp("r", "rename"),
+	),
+	InsertBelow: key.NewBinding(
+		key.WithKeys("i"),
+		key.WithHelp("i", "insert below"),
+	),
+	InsertAbove: key.NewBinding(
+		key.WithKeys("I"),
+		key.WithHelp("I", "insert above"),
 	),
 	Undo: key.NewBinding(
 		key.WithKeys("z"),
@@ -116,6 +127,11 @@ type Model struct {
 	renameInput    textinput.Model
 	renameOriginal string // original branch name shown as label
 
+	// Insert mode
+	insertMode      bool
+	insertDirection ActionType // ActionInsertBelow or ActionInsertAbove
+	insertInput     textinput.Model
+
 	// Help overlay
 	showHelp bool
 
@@ -138,6 +154,9 @@ type Model struct {
 func New(nodes []ModifyBranchNode, trunk stack.BranchRef, version string) Model {
 	ti := textinput.New()
 	ti.CharLimit = 100
+
+	ii := textinput.New()
+	ii.CharLimit = 100
 
 	// Default cursor to the current active branch, or first non-merged branch
 	cursor := 0
@@ -164,6 +183,7 @@ func New(nodes []ModifyBranchNode, trunk stack.BranchRef, version string) Model 
 		version:     version,
 		cursor:      cursor,
 		renameInput: ti,
+		insertInput: ii,
 	}
 }
 
@@ -209,6 +229,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.renameMode {
 			return m.updateRename(msg)
+		}
+		if m.insertMode {
+			return m.updateInsert(msg)
 		}
 		return m.updateNormal(msg)
 
@@ -290,6 +313,24 @@ func (m Model) updateRename(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// For inserted nodes, update the insert action's name directly
+		// rather than creating a separate rename action.
+		if node.IsInserted {
+			oldInsertName := node.Ref.Branch
+			node.Ref.Branch = newName
+			node.PendingAction.NewName = newName
+			// Update the matching undo stack entry
+			for i := len(m.actionStack) - 1; i >= 0; i-- {
+				a := &m.actionStack[i]
+				if (a.Type == ActionInsertBelow || a.Type == ActionInsertAbove) && a.BranchName == oldInsertName {
+					a.BranchName = newName
+					break
+				}
+			}
+			m.renameMode = false
+			return m, nil
+		}
+
 		// Record undo action
 		m.actionStack = append(m.actionStack, StagedAction{
 			Type:         ActionRename,
@@ -316,7 +357,94 @@ func (m Model) updateRename(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// updateNormal handles keys during normal (non-modal) interaction.
+// updateInsert handles keys while in insert mode (typing a new branch name).
+func (m Model) updateInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		newName := strings.TrimSpace(m.insertInput.Value())
+		if newName == "" {
+			m.insertMode = false
+			return m, nil
+		}
+
+		// Validate: git ref name rules
+		if err := git.ValidateRefName(newName); err != nil {
+			m.statusMessage = fmt.Sprintf("Invalid branch name: %s", err)
+			m.statusIsError = true
+			return m, nil
+		}
+
+		// Validate: not already used by another local branch
+		if git.BranchExists(newName) {
+			m.statusMessage = fmt.Sprintf("Branch %q already exists locally", newName)
+			m.statusIsError = true
+			return m, nil
+		}
+
+		// Validate: not already used in this stack (by another node)
+		for _, other := range m.nodes {
+			checkName := other.Ref.Branch
+			if other.PendingAction != nil && other.PendingAction.Type == ActionRename {
+				checkName = other.PendingAction.NewName
+			}
+			if other.PendingAction != nil && (other.PendingAction.Type == ActionInsertBelow || other.PendingAction.Type == ActionInsertAbove) {
+				checkName = other.PendingAction.NewName
+			}
+			if checkName == newName {
+				m.statusMessage = fmt.Sprintf("Branch %q already used in this stack", newName)
+				m.statusIsError = true
+				return m, nil
+			}
+		}
+
+		// Determine insertion position
+		insertIdx := m.cursor
+		if m.insertDirection == ActionInsertBelow {
+			insertIdx = m.cursor + 1
+		}
+		// For InsertAbove, insertIdx stays at m.cursor (insert before cursor)
+
+		// Create the new node
+		newNode := ModifyBranchNode{
+			BranchNode: stackview.BranchNode{
+				Ref:      stack.BranchRef{Branch: newName},
+				IsLinear: true,
+			},
+			PendingAction: &PendingAction{
+				Type:    m.insertDirection,
+				NewName: newName,
+			},
+			OriginalPosition: -1, // sentinel: this node has no original position
+			IsInserted:       true,
+		}
+
+		// Insert the node into the slice
+		m.nodes = append(m.nodes, ModifyBranchNode{})
+		copy(m.nodes[insertIdx+1:], m.nodes[insertIdx:])
+		m.nodes[insertIdx] = newNode
+
+		// Record undo action
+		m.actionStack = append(m.actionStack, StagedAction{
+			Type:       m.insertDirection,
+			BranchName: newName,
+		})
+
+		// Move cursor to the newly inserted node
+		m.cursor = insertIdx
+		m.insertMode = false
+		m.ensureVisible()
+		return m, nil
+
+	case tea.KeyEscape:
+		m.insertMode = false
+		return m, nil
+
+	default:
+		var cmd tea.Cmd
+		m.insertInput, cmd = m.insertInput.Update(msg)
+		return m, cmd
+	}
+}
 func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, modifyKeys.Quit):
@@ -333,7 +461,7 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, modifyKeys.MoveUp):
 		if m.currentMode() == modeStructure {
-			m.statusMessage = "Cannot reorder while drops, folds, or renames are staged — undo them first"
+			m.statusMessage = "Cannot reorder while drops, folds, inserts, or renames are staged — undo them first"
 			m.statusIsError = true
 			return m, nil
 		}
@@ -342,7 +470,7 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, modifyKeys.MoveDown):
 		if m.currentMode() == modeStructure {
-			m.statusMessage = "Cannot reorder while drops, folds, or renames are staged — undo them first"
+			m.statusMessage = "Cannot reorder while drops, folds, inserts, or renames are staged — undo them first"
 			m.statusIsError = true
 			return m, nil
 		}
@@ -383,6 +511,24 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.startRename()
+		return m, nil
+
+	case key.Matches(msg, modifyKeys.InsertBelow):
+		if m.currentMode() == modeReorder {
+			m.statusMessage = "Cannot insert while branches are reordered — undo moves first"
+			m.statusIsError = true
+			return m, nil
+		}
+		m.startInsert(ActionInsertBelow)
+		return m, nil
+
+	case key.Matches(msg, modifyKeys.InsertAbove):
+		if m.currentMode() == modeReorder {
+			m.statusMessage = "Cannot insert while branches are reordered — undo moves first"
+			m.statusIsError = true
+			return m, nil
+		}
+		m.startInsert(ActionInsertAbove)
 		return m, nil
 
 	case key.Matches(msg, modifyKeys.Undo):
@@ -432,17 +578,28 @@ func (m *Model) currentMode() actionMode {
 	hasReorder := false
 	hasStructure := false
 
-	for i, n := range m.nodes {
+	for _, n := range m.nodes {
 		if n.PendingAction != nil {
 			switch n.PendingAction.Type {
-			case ActionDrop, ActionFoldDown, ActionFoldUp, ActionRename:
+			case ActionDrop, ActionFoldDown, ActionFoldUp, ActionRename, ActionInsertBelow, ActionInsertAbove:
 				hasStructure = true
 			}
 		}
-		// Position change without explicit action = reorder
-		if !n.Ref.IsMerged() && n.OriginalPosition != i && n.PendingAction == nil {
-			hasReorder = true
+	}
+
+	// Position change without explicit action = reorder.
+	// Skip inserted nodes — they don't have an original position and
+	// their presence shifts indices of other nodes.
+	effectiveIdx := 0
+	for _, n := range m.nodes {
+		if n.IsInserted {
+			continue
 		}
+		if !n.Ref.IsMerged() && n.OriginalPosition != effectiveIdx && n.PendingAction == nil {
+			hasReorder = true
+			break
+		}
+		effectiveIdx++
 	}
 
 	if hasReorder {
@@ -525,6 +682,30 @@ func (m *Model) toggleDrop() {
 		return
 	}
 
+	// Dropping an inserted node removes it entirely (undo the insert).
+	// Pop the original insert action from the undo stack rather than
+	// pushing a new entry — this makes the drop behave as a direct
+	// cancellation of the insert.
+	if node.IsInserted {
+		branchName := node.Ref.Branch
+		m.nodes = append(m.nodes[:m.cursor], m.nodes[m.cursor+1:]...)
+		// Remove the matching insert action from the undo stack
+		for i := len(m.actionStack) - 1; i >= 0; i-- {
+			a := m.actionStack[i]
+			if (a.Type == ActionInsertBelow || a.Type == ActionInsertAbove) && a.BranchName == branchName {
+				m.actionStack = append(m.actionStack[:i], m.actionStack[i+1:]...)
+				break
+			}
+		}
+		if m.cursor >= len(m.nodes) {
+			m.cursor = len(m.nodes) - 1
+		}
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		return
+	}
+
 	if node.PendingAction != nil && node.PendingAction.Type == ActionDrop {
 		// Undo drop
 		m.actionStack = append(m.actionStack, StagedAction{
@@ -537,6 +718,8 @@ func (m *Model) toggleDrop() {
 		// Check if any other branch has a fold targeting this branch.
 		// A fold-up targets the branch above (lower index), fold-down
 		// targets the branch below (higher index).
+		// Also check if dropping this branch would cause a fold to
+		// retarget to an inserted branch.
 		for i, other := range m.nodes {
 			if other.PendingAction == nil || i == m.cursor {
 				continue
@@ -546,6 +729,25 @@ func (m *Model) toggleDrop() {
 				for j := i - 1; j >= 0; j-- {
 					if !m.nodes[j].Removed && !m.nodes[j].Ref.IsMerged() {
 						if j == m.cursor {
+							// This branch is the current target. Check what the
+							// next target would be after dropping it.
+							nextTarget := -1
+							for k := j - 1; k >= 0; k-- {
+								if !m.nodes[k].Removed && !m.nodes[k].Ref.IsMerged() {
+									nextTarget = k
+									break
+								}
+							}
+							if nextTarget < 0 {
+								m.statusMessage = fmt.Sprintf("Cannot drop: %s is folding into this branch", other.Ref.Branch)
+								m.statusIsError = true
+								return
+							}
+							if m.nodes[nextTarget].IsInserted {
+								m.statusMessage = fmt.Sprintf("Cannot drop: %s would fold into an inserted branch", other.Ref.Branch)
+								m.statusIsError = true
+								return
+							}
 							m.statusMessage = fmt.Sprintf("Cannot drop: %s is folding into this branch", other.Ref.Branch)
 							m.statusIsError = true
 							return
@@ -559,6 +761,25 @@ func (m *Model) toggleDrop() {
 				for j := i + 1; j < len(m.nodes); j++ {
 					if !m.nodes[j].Removed && !m.nodes[j].Ref.IsMerged() {
 						if j == m.cursor {
+							// This branch is the current target. Check what the
+							// next target would be after dropping it.
+							nextTarget := -1
+							for k := j + 1; k < len(m.nodes); k++ {
+								if !m.nodes[k].Removed && !m.nodes[k].Ref.IsMerged() {
+									nextTarget = k
+									break
+								}
+							}
+							if nextTarget < 0 {
+								m.statusMessage = fmt.Sprintf("Cannot drop: %s is folding into this branch", other.Ref.Branch)
+								m.statusIsError = true
+								return
+							}
+							if m.nodes[nextTarget].IsInserted {
+								m.statusMessage = fmt.Sprintf("Cannot drop: %s would fold into an inserted branch", other.Ref.Branch)
+								m.statusIsError = true
+								return
+							}
 							m.statusMessage = fmt.Sprintf("Cannot drop: %s is folding into this branch", other.Ref.Branch)
 							m.statusIsError = true
 							return
@@ -569,13 +790,13 @@ func (m *Model) toggleDrop() {
 			}
 		}
 
-		// Check if this would remove the last active branch
+		// Check if this would remove the last active original branch
 		active := 0
 		for j, other := range m.nodes {
 			if j == m.cursor {
 				continue // skip the branch we're about to drop
 			}
-			if !other.Removed && !other.Ref.IsMerged() {
+			if !other.Removed && !other.Ref.IsMerged() && !other.IsInserted {
 				active++
 			}
 		}
@@ -601,6 +822,11 @@ func (m *Model) fold(action ActionType) {
 		return
 	}
 	node := &m.nodes[m.cursor]
+	if node.IsInserted {
+		m.statusMessage = "Cannot fold an inserted branch — drop it with x to remove"
+		m.statusIsError = true
+		return
+	}
 	if node.Ref.IsMerged() {
 		m.statusMessage = "Cannot fold a merged branch"
 		m.statusIsError = true
@@ -630,6 +856,38 @@ func (m *Model) fold(action ActionType) {
 		return
 	}
 
+	// Check if the current node is the target of another fold — folding
+	// a branch that is receiving commits from another fold is not allowed.
+	for i, other := range m.nodes {
+		if other.PendingAction == nil || i == m.cursor {
+			continue
+		}
+		if other.PendingAction.Type == ActionFoldUp {
+			for j := i - 1; j >= 0; j-- {
+				if !m.nodes[j].Removed && !m.nodes[j].Ref.IsMerged() {
+					if j == m.cursor {
+						m.statusMessage = fmt.Sprintf("Cannot fold: %s is folding into this branch", other.Ref.Branch)
+						m.statusIsError = true
+						return
+					}
+					break
+				}
+			}
+		}
+		if other.PendingAction.Type == ActionFoldDown {
+			for j := i + 1; j < len(m.nodes); j++ {
+				if !m.nodes[j].Removed && !m.nodes[j].Ref.IsMerged() {
+					if j == m.cursor {
+						m.statusMessage = fmt.Sprintf("Cannot fold: %s is folding into this branch", other.Ref.Branch)
+						m.statusIsError = true
+						return
+					}
+					break
+				}
+			}
+		}
+	}
+
 	// Find the target branch
 	var targetIdx int
 	var found bool
@@ -648,6 +906,11 @@ func (m *Model) fold(action ActionType) {
 			m.statusIsError = true
 			return
 		}
+		if m.nodes[targetIdx].IsInserted {
+			m.statusMessage = "Cannot fold into an inserted branch"
+			m.statusIsError = true
+			return
+		}
 	} else {
 		// Fold up: target is the previous non-removed, non-merged node away from trunk (lower index)
 		for i := m.cursor - 1; i >= 0; i-- {
@@ -662,15 +925,28 @@ func (m *Model) fold(action ActionType) {
 			m.statusIsError = true
 			return
 		}
+		if m.nodes[targetIdx].IsInserted {
+			m.statusMessage = "Cannot fold into an inserted branch"
+			m.statusIsError = true
+			return
+		}
 	}
 
-	// Check if this would remove the last active branch
+	// Check if the target is already folding (mutual fold / chain fold)
+	target := &m.nodes[targetIdx]
+	if target.PendingAction != nil && (target.PendingAction.Type == ActionFoldDown || target.PendingAction.Type == ActionFoldUp) {
+		m.statusMessage = fmt.Sprintf("Cannot fold: %s is already folding in the opposite direction", target.Ref.Branch)
+		m.statusIsError = true
+		return
+	}
+
+	// Check if this would remove the last active original branch
 	active := 0
 	for j, other := range m.nodes {
 		if j == m.cursor {
 			continue
 		}
-		if !other.Removed && !other.Ref.IsMerged() {
+		if !other.Removed && !other.Ref.IsMerged() && !other.IsInserted {
 			active++
 		}
 	}
@@ -710,6 +986,66 @@ func (m *Model) startRename() {
 	m.renameInput.Prompt = ""
 	m.renameInput.Focus()
 	m.renameInput.CursorEnd()
+}
+
+// startInsert enters insert mode to type a new branch name.
+func (m *Model) startInsert(direction ActionType) {
+	if m.cursor < 0 || m.cursor >= len(m.nodes) {
+		return
+	}
+	node := &m.nodes[m.cursor]
+	if node.Ref.IsMerged() {
+		m.statusMessage = "Cannot insert next to a merged branch"
+		m.statusIsError = true
+		return
+	}
+	if node.Removed {
+		return
+	}
+
+	// Compute where the node would be inserted
+	insertIdx := m.cursor
+	if direction == ActionInsertBelow {
+		insertIdx = m.cursor + 1
+	}
+
+	// Check if inserting here would place the new branch between a
+	// folding branch and its target, making it the new fold target.
+	for i, other := range m.nodes {
+		if other.PendingAction == nil {
+			continue
+		}
+		if other.PendingAction.Type == ActionFoldDown {
+			for j := i + 1; j < len(m.nodes); j++ {
+				if !m.nodes[j].Removed && !m.nodes[j].Ref.IsMerged() {
+					if insertIdx > i && insertIdx <= j {
+						m.statusMessage = fmt.Sprintf("Cannot insert here: %s is folding into %s", other.Ref.Branch, m.nodes[j].Ref.Branch)
+						m.statusIsError = true
+						return
+					}
+					break
+				}
+			}
+		}
+		if other.PendingAction.Type == ActionFoldUp {
+			for j := i - 1; j >= 0; j-- {
+				if !m.nodes[j].Removed && !m.nodes[j].Ref.IsMerged() {
+					if insertIdx > j && insertIdx <= i {
+						m.statusMessage = fmt.Sprintf("Cannot insert here: %s is folding into %s", other.Ref.Branch, m.nodes[j].Ref.Branch)
+						m.statusIsError = true
+						return
+					}
+					break
+				}
+			}
+		}
+	}
+
+	m.insertMode = true
+	m.insertDirection = direction
+	m.insertInput.SetValue("")
+	m.insertInput.Prompt = ""
+	m.insertInput.Focus()
 }
 
 // undoLast reverses the most recent action from the stack.
@@ -775,21 +1111,41 @@ func (m *Model) undoLast() {
 				break
 			}
 		}
+
+	case ActionInsertBelow, ActionInsertAbove:
+		// Remove the inserted node from the slice
+		for i := range m.nodes {
+			if m.nodes[i].IsInserted && m.nodes[i].Ref.Branch == action.BranchName {
+				m.nodes = append(m.nodes[:i], m.nodes[i+1:]...)
+				if m.cursor >= len(m.nodes) {
+					m.cursor = len(m.nodes) - 1
+				}
+				if m.cursor < 0 {
+					m.cursor = 0
+				}
+				break
+			}
+		}
 	}
 }
 
 // tryApply validates and initiates apply.
 func (m Model) tryApply() (tea.Model, tea.Cmd) {
 	hasPending := false
-	for i, n := range m.nodes {
+	effectiveIdx := 0
+	for _, n := range m.nodes {
 		if n.PendingAction != nil {
 			hasPending = true
 			break
 		}
-		if !n.Removed && n.OriginalPosition != i {
+		if n.IsInserted {
+			continue
+		}
+		if !n.Removed && n.OriginalPosition != effectiveIdx {
 			hasPending = true
 			break
 		}
+		effectiveIdx++
 	}
 
 	if !hasPending {
@@ -798,10 +1154,10 @@ func (m Model) tryApply() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Ensure at least one non-removed, non-merged branch remains
+	// Ensure at least one non-removed, non-merged, non-inserted branch remains
 	active := 0
 	for _, n := range m.nodes {
-		if !n.Removed && !n.Ref.IsMerged() {
+		if !n.Removed && !n.Ref.IsMerged() && !n.IsInserted {
 			active++
 		}
 	}
@@ -832,7 +1188,7 @@ func (m *Model) ensureVisible() {
 }
 
 func (m Model) nodeLineCount(idx int) int {
-	return shared.NodeLineCount(toNodeData(m.nodes[idx], idx))
+	return shared.NodeLineCount(toNodeData(m.nodes[idx], idx, idx))
 }
 
 func (m Model) contentViewHeight() int {
@@ -862,7 +1218,7 @@ func (m *Model) clampScroll() {
 func (m Model) handleMouseClick(screenX, screenY int) (tea.Model, tea.Cmd) {
 	nodes := make([]shared.BranchNodeData, len(m.nodes))
 	for i, n := range m.nodes {
-		nodes[i] = toNodeData(n, i)
+		nodes[i] = toNodeData(n, i, i)
 	}
 
 	result := shared.HandleClick(screenX, screenY, nodes, m.width, m.height, m.scrollOffset, shared.ShouldShowHeader(m.width, m.height), false)
@@ -896,8 +1252,9 @@ func (m Model) handleMouseClick(screenX, screenY int) (tea.Model, tea.Cmd) {
 
 // toNodeData converts a ModifyBranchNode to shared.BranchNodeData,
 // applying drop/fold/move visual overrides. currentIdx is the node's
-// current position in the list, used to detect moves.
-func toNodeData(n ModifyBranchNode, currentIdx int) shared.BranchNodeData {
+// current position in the list. effectiveIdx is the position among
+// non-inserted nodes (used for move detection).
+func toNodeData(n ModifyBranchNode, currentIdx int, effectiveIdx int) shared.BranchNodeData {
 	data := shared.BranchNodeData{
 		Ref:             n.Ref,
 		IsCurrent:       n.IsCurrent,
@@ -926,11 +1283,16 @@ func toNodeData(n ModifyBranchNode, currentIdx int) shared.BranchNodeData {
 			data.BranchNameStyleOverride = &s
 			data.ConnectorStyleOverride = &c
 			data.ForceDashedConnector = true
+		case ActionInsertBelow, ActionInsertAbove:
+			s := insertBranchStyle
+			c := insertConnectorStyle
+			data.BranchNameStyleOverride = &s
+			data.ConnectorStyleOverride = &c
 		}
 	}
 
 	// Moved branch: purple solid connector (no dash, no strikethrough)
-	if n.PendingAction == nil && !n.Ref.IsMerged() && n.OriginalPosition != currentIdx {
+	if n.PendingAction == nil && !n.Ref.IsMerged() && !n.IsInserted && n.OriginalPosition != effectiveIdx {
 		c := movedConnectorStyle
 		data.ConnectorStyleOverride = &c
 	}
@@ -939,8 +1301,9 @@ func toNodeData(n ModifyBranchNode, currentIdx int) shared.BranchNodeData {
 }
 
 // nodeAnnotation builds an optional annotation from the node's pending action
-// or its position change. currentIdx is the node's current position in the list.
-func nodeAnnotation(n ModifyBranchNode, currentIdx int) *shared.NodeAnnotation {
+// or its position change. effectiveIdx is the node's position among non-inserted
+// nodes, used for move detection.
+func nodeAnnotation(n ModifyBranchNode, effectiveIdx int) *shared.NodeAnnotation {
 	if n.Ref.IsMerged() {
 		return &shared.NodeAnnotation{Text: "🔒", Style: shared.DimStyle}
 	}
@@ -954,13 +1317,15 @@ func nodeAnnotation(n ModifyBranchNode, currentIdx int) *shared.NodeAnnotation {
 			return &shared.NodeAnnotation{Text: "↑ fold up", Style: foldBadge}
 		case ActionRename:
 			return &shared.NodeAnnotation{Text: "→ " + n.PendingAction.NewName, Style: renameBadge}
+		case ActionInsertBelow, ActionInsertAbove:
+			return &shared.NodeAnnotation{Text: "✚ insert", Style: insertBadge}
 		case ActionMove:
 			return &shared.NodeAnnotation{Text: "↕ moved", Style: moveBadge}
 		}
 	}
 	// Show move annotation when position changed (even without explicit PendingAction)
-	if !n.Ref.IsMerged() && n.OriginalPosition != currentIdx {
-		delta := n.OriginalPosition - currentIdx // positive = moved up (toward top)
+	if !n.Ref.IsMerged() && !n.IsInserted && n.OriginalPosition != effectiveIdx {
+		delta := n.OriginalPosition - effectiveIdx // positive = moved up (toward top)
 		direction := "up"
 		layers := delta
 		if delta < 0 {
@@ -996,10 +1361,17 @@ func (m Model) View() string {
 
 	// Build the scrollable branch list content
 	var b strings.Builder
+	effectiveIdx := 0
 	for i := 0; i < len(m.nodes); i++ {
-		nodeData := toNodeData(m.nodes[i], i)
+		ei := effectiveIdx
+		if m.nodes[i].IsInserted {
+			ei = -1 // inserted nodes have no effective position
+		} else {
+			effectiveIdx++
+		}
+		nodeData := toNodeData(m.nodes[i], i, ei)
 		isFocused := i == m.cursor
-		annotation := nodeAnnotation(m.nodes[i], i)
+		annotation := nodeAnnotation(m.nodes[i], ei)
 		shared.RenderNode(&b, nodeData, isFocused, m.width, annotation)
 	}
 	shared.RenderTrunk(&b, m.trunk.Branch)
@@ -1036,6 +1408,13 @@ func (m Model) View() string {
 	if m.renameMode {
 		out.WriteString(renameBadge.Render(fmt.Sprintf("Rename: %s → ", m.renameOriginal)))
 		out.WriteString(m.renameInput.View())
+	} else if m.insertMode {
+		direction := "below"
+		if m.insertDirection == ActionInsertAbove {
+			direction = "above"
+		}
+		out.WriteString(insertBadge.Render(fmt.Sprintf("Insert %s: ", direction)))
+		out.WriteString(m.insertInput.View())
 	} else {
 		out.WriteString(renderStatusLine(m.nodes, m.width))
 	}
@@ -1052,7 +1431,13 @@ func (m Model) buildHeaderConfig() shared.HeaderConfig {
 		}
 	}
 
-	branchCount := len(m.nodes)
+	// Count only original branches (exclude staged inserts)
+	branchCount := 0
+	for _, n := range m.nodes {
+		if !n.IsInserted {
+			branchCount++
+		}
+	}
 	branchInfo := fmt.Sprintf("%d branches", branchCount)
 	if branchCount == 1 {
 		branchInfo = "1 branch"
@@ -1088,8 +1473,8 @@ func (m Model) buildHeaderConfig() shared.HeaderConfig {
 			// Left column                          // Right column
 			{Key: "↑↓", Desc: "select branch"}, {Key: "x", Desc: "drop", Disabled: structureDisabled},
 			{Key: "f", Desc: "view files"}, {Key: "r", Desc: "rename", Disabled: structureDisabled},
-			{Key: "c", Desc: "view commits"}, {Key: "u", Desc: "fold up", Disabled: structureDisabled},
-			{Key: "?", Desc: "help"}, {Key: "d", Desc: "fold down", Disabled: structureDisabled},
+			{Key: "c", Desc: "view commits"}, {Key: "i/I", Desc: "insert below/above", Disabled: structureDisabled},
+			{Key: "?", Desc: "help"}, {Key: "d/u", Desc: "fold down/up", Disabled: structureDisabled},
 			{Key: "q/esc", Desc: "quit"}, {Key: "shift+↑↓", Desc: "reorder", Disabled: reorderDisabled},
 			{Key: "^S", Desc: "apply changes"}, {Key: "z", Desc: "undo"},
 		},
