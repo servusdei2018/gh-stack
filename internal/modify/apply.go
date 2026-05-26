@@ -495,8 +495,14 @@ func ApplyPlan(
 		result.MovedBranches++
 	}
 
-	// Restore original branch
-	_ = git.CheckoutBranch(currentBranch)
+	// Check out the best branch — the original if it's still in the stack,
+	// otherwise the nearest surviving branch.
+	targetBranch := resolveCheckoutBranch(currentBranch, plan, snapshot, s)
+	if err := git.CheckoutBranch(targetBranch); err == nil {
+		if targetBranch != currentBranch {
+			cfg.Printf("Switched to %s (original branch %s is no longer in the stack)", targetBranch, currentBranch)
+		}
+	}
 
 	// Update base SHAs
 	updateBaseSHAs(s)
@@ -518,6 +524,126 @@ func ApplyPlan(
 	}
 
 	return result, nil, nil
+}
+
+// resolveCheckoutBranch determines which branch to check out after a modify
+// operation completes. If the user's original branch was dropped, folded, or
+// renamed, this returns the most appropriate surviving branch.
+func resolveCheckoutBranch(originalBranch string, plan []Action, snapshot Snapshot, s *stack.Stack) string {
+	// Check if the original branch is still in the stack — quick exit.
+	if s.IndexOf(originalBranch) >= 0 {
+		return originalBranch
+	}
+
+	// Build a rename map (old name → new name) so we can translate snapshot
+	// neighbor names that may have been renamed in the same modify operation.
+	renames := make(map[string]string)
+	for _, a := range plan {
+		if a.Type == "rename" && a.NewName != "" {
+			renames[a.Branch] = a.NewName
+		}
+	}
+
+	// resolvedName returns the post-rename name for a branch, or the
+	// original name if it wasn't renamed.
+	resolvedName := func(name string) string {
+		if newName, ok := renames[name]; ok {
+			return newName
+		}
+		return name
+	}
+
+	// Scan the plan for an action that targeted the original branch.
+	for _, a := range plan {
+		if a.Branch != originalBranch {
+			continue
+		}
+
+		switch a.Type {
+		case "rename":
+			if a.NewName != "" && s.IndexOf(a.NewName) >= 0 {
+				return a.NewName
+			}
+
+		case "fold_down":
+			// Fold-down merges into the branch below in the original order.
+			if target := adjacentSnapshotBranch(snapshot, originalBranch, -1); target != "" {
+				resolved := resolvedName(target)
+				if s.IndexOf(resolved) >= 0 {
+					return resolved
+				}
+			}
+
+		case "fold_up":
+			// Fold-up merges into the branch above in the original order.
+			if target := adjacentSnapshotBranch(snapshot, originalBranch, +1); target != "" {
+				resolved := resolvedName(target)
+				if s.IndexOf(resolved) >= 0 {
+					return resolved
+				}
+			}
+
+		case "drop":
+			// Prefer the branch that was directly above in the original order,
+			// then fall back to the one below.
+			if nearest := nearestSurvivingBranch(snapshot, originalBranch, s, resolvedName); nearest != "" {
+				return nearest
+			}
+		}
+	}
+
+	// Fallback: topmost branch in the stack.
+	if len(s.Branches) > 0 {
+		return s.Branches[len(s.Branches)-1].Branch
+	}
+	return originalBranch
+}
+
+// adjacentSnapshotBranch returns the branch adjacent to target in the snapshot.
+// direction -1 means below (toward trunk), +1 means above (away from trunk).
+func adjacentSnapshotBranch(snapshot Snapshot, target string, direction int) string {
+	for i, bs := range snapshot.Branches {
+		if bs.Name == target {
+			adj := i + direction
+			if adj >= 0 && adj < len(snapshot.Branches) {
+				return snapshot.Branches[adj].Name
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// nearestSurvivingBranch finds the closest branch to the dropped branch that
+// still exists in the stack. Prefers the branch above (higher index), then below.
+// resolvedName translates snapshot names through any renames from the same operation.
+func nearestSurvivingBranch(snapshot Snapshot, dropped string, s *stack.Stack, resolvedName func(string) string) string {
+	pos := -1
+	for i, bs := range snapshot.Branches {
+		if bs.Name == dropped {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return ""
+	}
+
+	// Search above first (higher indices = away from trunk)
+	for i := pos + 1; i < len(snapshot.Branches); i++ {
+		name := resolvedName(snapshot.Branches[i].Name)
+		if s.IndexOf(name) >= 0 {
+			return name
+		}
+	}
+	// Then below (lower indices = toward trunk)
+	for i := pos - 1; i >= 0; i-- {
+		name := resolvedName(snapshot.Branches[i].Name)
+		if s.IndexOf(name) >= 0 {
+			return name
+		}
+	}
+	return ""
 }
 
 // ContinueApply resumes a modify operation after the user resolves a rebase conflict.
@@ -657,9 +783,14 @@ func ContinueApply(
 		cfg.Successf("Rebased %s onto %s", branchName, newBase)
 	}
 
-	// All rebases done — restore original branch
+	// All rebases done — check out the best branch
 	if state.OriginalBranch != "" {
-		_ = git.CheckoutBranch(state.OriginalBranch)
+		targetBranch := resolveCheckoutBranch(state.OriginalBranch, state.Plan, state.Snapshot, s)
+		if err := git.CheckoutBranch(targetBranch); err == nil {
+			if targetBranch != state.OriginalBranch {
+				cfg.Printf("Switched to %s (original branch %s is no longer in the stack)", targetBranch, state.OriginalBranch)
+			}
+		}
 	}
 
 	// Update base SHAs
