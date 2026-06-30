@@ -225,7 +225,7 @@ func (m Model) handleMouseClick(screenX, screenY int) (tea.Model, tea.Cmd) {
 		nodes[i] = toBranchNodeData(n)
 	}
 
-	result := shared.HandleClick(screenX, screenY, nodes, m.width, m.height, m.scrollOffset, shared.ShouldShowHeader(m.width, m.height), true)
+	result := shared.HandleClick(screenX, screenY, nodes, m.width, m.height, m.scrollOffset, m.headerHeight(), true)
 	if result.NodeIndex < 0 {
 		return m, nil
 	}
@@ -329,13 +329,18 @@ func (m Model) totalContentLines() int {
 	return lines
 }
 
+// headerHeight returns the number of rows the header occupies for this model's
+// config, or 0 when the header is hidden.
+func (m Model) headerHeight() int {
+	if shared.ShouldShowHeader(m.width, m.height) {
+		return shared.HeaderHeightFor(m.buildHeaderConfig())
+	}
+	return 0
+}
+
 // contentViewHeight returns the number of lines available for stack content.
 func (m Model) contentViewHeight() int {
-	reserved := 0
-	if shared.ShouldShowHeader(m.width, m.height) {
-		reserved = shared.HeaderHeight
-	}
-	h := m.height - reserved
+	h := m.height - m.headerHeight()
 	if h < 1 {
 		h = 1
 	}
@@ -355,8 +360,17 @@ func (m Model) View() string {
 	var out strings.Builder
 
 	showHeader := shared.ShouldShowHeader(m.width, m.height)
+	reservedLines := 0
 	if showHeader {
-		shared.RenderHeader(&out, m.buildHeaderConfig(), m.width, m.height)
+		// Build the header config once and reuse it for both rendering and the
+		// height reservation, so View does not rebuild it twice per frame.
+		cfg := m.buildHeaderConfig()
+		shared.RenderHeader(&out, cfg, m.width, m.height)
+		reservedLines = shared.HeaderHeightFor(cfg)
+	} else {
+		// The header (and its inline-image logo) is hidden; clear any logo that
+		// was previously drawn so it does not linger in the graphics layer.
+		out.WriteString(shared.ClearLogo())
 	}
 
 	var b strings.Builder
@@ -383,10 +397,6 @@ func (m Model) View() string {
 	content := b.String()
 
 	// Apply scrolling
-	reservedLines := 0
-	if showHeader {
-		reservedLines = shared.HeaderHeight
-	}
 	viewHeight := m.height - reservedLines
 	if viewHeight < 1 {
 		viewHeight = 1
@@ -440,8 +450,7 @@ func (m Model) buildHeaderConfig() shared.HeaderConfig {
 		},
 		ShortcutColumns: 1,
 		Shortcuts: []shared.ShortcutEntry{
-			{Key: "↑", Desc: "up"},
-			{Key: "↓", Desc: "down"},
+			{Key: "↑↓", Desc: "navigate"},
 			{Key: "c", Desc: "commits"},
 			{Key: "f", Desc: "files"},
 			{Key: "o", Desc: "open PR"},
