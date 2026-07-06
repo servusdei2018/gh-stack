@@ -1485,9 +1485,64 @@ func TestSync_InteractivePrune_PromptsAndPrunes(t *testing.T) {
 	output := string(errOut)
 
 	assert.NoError(t, err)
-	assert.Contains(t, promptShown, "Prune 1 merged branch")
+	assert.Equal(t, "Prune 1 merged branch(es)?", promptShown)
+	assert.Contains(t, output, "The following merged branches will be pruned:\n  - b1\n")
 	assert.Equal(t, []string{"b1"}, deletedBranches)
 	assert.Contains(t, output, "Pruned b1 (merged)")
+}
+
+// TestSync_InteractivePrune_PromptsAndPrunesMultiple verifies that when running in an
+// interactive terminal with multiple merged branches without --prune, all targeted
+// branches are listed in a bulleted layout and the prompt is shown.
+func TestSync_InteractivePrune_PromptsAndPrunesMultiple(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{Branch: "b1", PullRequest: &stack.PullRequestRef{Number: 1, Merged: true}},
+			{Branch: "b2", PullRequest: &stack.PullRequestRef{Number: 2, Merged: true}},
+			{Branch: "b3"},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	writeStackFile(t, tmpDir, s)
+
+	var deletedBranches []string
+	var promptShown string
+
+	mock := newSyncMock(tmpDir, "b3")
+	mock.BranchExistsFn = func(name string) bool { return true }
+	mock.DeleteBranchFn = func(name string, force bool) error {
+		deletedBranches = append(deletedBranches, name)
+		return nil
+	}
+
+	restore := git.SetOps(mock)
+	defer restore()
+
+	cfg, _, errR := config.NewTestConfig()
+	cfg.ForceInteractive = true
+	cfg.ConfirmFn = func(prompt string, defaultValue bool) (bool, error) {
+		promptShown = prompt
+		assert.True(t, defaultValue, "default should be yes")
+		return true, nil // user confirms
+	}
+
+	cmd := SyncCmd(cfg)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+
+	cfg.Err.Close()
+	errOut, _ := io.ReadAll(errR)
+	output := string(errOut)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "Prune 2 merged branch(es)?", promptShown)
+	assert.Contains(t, output, "The following merged branches will be pruned:\n  - b1\n  - b2\n")
+	assert.Equal(t, []string{"b1", "b2"}, deletedBranches)
+	assert.Contains(t, output, "Pruned b1 (merged)")
+	assert.Contains(t, output, "Pruned b2 (merged)")
 }
 
 // TestSync_InteractivePrune_UserDeclines verifies that when the user declines
